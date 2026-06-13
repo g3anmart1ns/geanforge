@@ -1,0 +1,787 @@
+#!/bin/bash
+
+################################################################################
+# geanforge - Secure Password Generator
+# Usage: Production and Homelab Kubernetes
+# Supports: X11, Wayland, macOS | OpenSSL, mkpasswd, urandom
+################################################################################
+
+set -euo pipefail
+
+# Colors
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly MAGENTA='\033[0;35m'
+readonly NC='\033[0m'
+
+# Security limits
+readonly MAX_LENGTH=256
+readonly MAX_QUANTITY=100
+readonly URANDOM_BUFFER=8192
+readonly MIN_ENTROPY=1000
+readonly MAX_PIN=12
+readonly MIN_WORDS=4
+
+# Common wordlist directories
+readonly WORDLISTS=(
+    "/usr/share/dict/words"
+    "/usr/share/dict/american-english"
+    "/usr/share/dict/brazilian"
+    "/usr/share/dict/portuguese"
+    "/usr/share/dict/cracklib-words"
+)
+
+# Logging functions
+_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
+_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo -e "${MAGENTA}[DEBUG]${NC} $*" >&2 || true; }
+
+# Secure memory cleanup
+_cleanup_sensitive_vars() {
+    local vars=("password" "generated_password" "charset" "last_password" "last_password_clipboard"
+                "plain_password" "pin" "passphrase" "temp_password" "hash_result")
+    for var in "${vars[@]}"; do
+        unset "$var" 2>/dev/null || true
+    done
+    # Clear bash history if in interactive mode
+    if [[ -n "${PS1:-}" ]]; then
+        history -c 2>/dev/null || true
+        history -w 2>/dev/null || true
+    fi
+}
+
+# Command verification
+command_exists() { command -v "$1" &>/dev/null; }
+
+# System entropy verification
+_check_entropy() {
+    if [ -r /proc/sys/kernel/random/entropy_avail ]; then
+        local entropy
+        entropy=$(cat /proc/sys/kernel/random/entropy_avail)
+        _debug "Available entropy: $entropy bits"
+        if [ "$entropy" -lt "$MIN_ENTROPY" ]; then
+            _warn "Low entropy ($entropy bits). Consider installing haveged or rng-tools"
+            _warn "On freshly booted VMs, wait a few seconds and try again"
+            if [[ "${FORCE_LOW_ENTROPY:-0}" != "1" ]]; then
+                read -rp "Continue anyway? [y/N]: " response
+                [[ "$response" =~ ^[Yy]$ ]] || return 1
+            fi
+        fi
+    fi
+}
+
+# Clipboard environment detection
+_detect_clipboard() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command_exists wl-copy; then
+        echo "wayland"
+    elif [ -n "${DISPLAY:-}" ] && command_exists xclip; then
+        echo "x11"
+    elif command_exists pbcopy; then
+        echo "macos"
+    else
+        echo "none"
+    fi
+}
+
+# Secure clipboard copy
+_copy_clipboard() {
+    local text="$1"
+    local clipboard_type
+    clipboard_type=$(_detect_clipboard)
+
+    case "$clipboard_type" in
+        wayland)
+            printf '%s' "$text" | wl-copy 2>/dev/null && return 0
+            ;;
+        x11)
+            printf '%s' "$text" | xclip -selection clipboard 2>/dev/null && return 0
+            ;;
+        macos)
+            printf '%s' "$text" | pbcopy 2>/dev/null && return 0
+            ;;
+    esac
+    return 1
+}
+
+# Generate character set (secure escape)
+_generate_charset() {
+    local hex_only=$1
+    local use_symbols=$2
+    local no_ambiguous=$3
+
+    if [ "$hex_only" = true ]; then
+        printf '%s' '0123456789ABCDEF'
+    elif [ "$no_ambiguous" = true ]; then
+        if [ "$use_symbols" = true ]; then
+            printf '%s' 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%^&*_=+[]{}:,.?~-'
+        else
+            printf '%s' 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+        fi
+    elif [ "$use_symbols" = true ]; then
+        printf '%s' 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#%^&*_=+[]{}:,.?~-'
+    else
+        printf '%s' 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    fi
+}
+
+# Generate via /dev/urandom (primary method)
+_generate_password_urandom() {
+    local length=$1
+    local charset=$2
+
+    local result
+    # Disable pipefail locally: when head closes after reading necessary bytes,
+    # tr receives SIGPIPE (signal 13). This is expected pipeline behavior, not a real error.
+    # Without this fix, pipefail captures tr's exit code 141 and false-negatives generation
+    # even with valid data.
+    set +o pipefail
+    result=$(LC_ALL=C tr -dc "$charset" < /dev/urandom 2>/dev/null | head -c "$length")
+    set -o pipefail
+
+    if [ "${#result}" -eq "$length" ]; then
+        printf '%s' "$result"
+        return 0
+    fi
+    return 1
+}
+
+# Generate via openssl with bias reduction
+_generate_password_openssl_rand() {
+    local length=$1
+    local no_ambiguous=${2:-false}
+
+    # Increase buffer to reduce base64 + tr bias
+    # Factor 4 is conservative to ensure sufficient entropy after filtering
+    local bytes_needed=$((length * 4 + 64))
+    local filter
+    local result
+
+    if [ "$no_ambiguous" = true ]; then
+        filter='a-km-np-zA-KM-NP-Z2-9'
+    else
+        filter='A-Za-z0-9'
+    fi
+
+    # Try multiple times if result is too short (aggressive filtering)
+    for attempt in 1 2 3; do
+        set +o pipefail
+        result=$(openssl rand -base64 "$bytes_needed" 2>/dev/null | \
+                   LC_ALL=C tr -dc "$filter" | \
+                   head -c "$length")
+        set -o pipefail
+
+        if [ "${#result}" -eq "$length" ]; then
+            printf '%s' "$result"
+            return 0
+        fi
+        _debug "Attempt $attempt: short result (${#result}), retrying..."
+        bytes_needed=$((bytes_needed * 2))  # Double buffer
+    done
+
+    return 1
+}
+
+# Generate numeric PIN (no leading zero for legacy compatibility)
+_generate_pin() {
+    local digits=$1
+    local first
+    local rest
+
+    # First digit: 1-9 (avoid leading zero in systems that treat as octal)
+    set +o pipefail
+    first=$(LC_ALL=C tr -dc '1-9' < /dev/urandom | head -c1)
+    set -o pipefail
+    [ -n "$first" ] || return 1
+
+    if [ "$digits" -eq 1 ]; then
+        printf '%s' "$first"
+        return 0
+    fi
+
+    # Remaining digits: 0-9 allowed
+    set +o pipefail
+    rest=$(LC_ALL=C tr -dc '0-9' < /dev/urandom | head -c$((digits - 1)))
+    set -o pipefail
+    [ -n "$rest" ] || return 1
+
+    printf '%s%s' "$first" "$rest"
+}
+
+# Generate Diceware-style passphrase
+_generate_passphrase() {
+    local num_words=$1
+    local separator=${2:--}  # Default: hyphen
+    local wordlist=""
+
+    # Find available wordlist
+    for wl in "${WORDLISTS[@]}"; do
+        if [ -r "$wl" ] && [ "$(wc -l < "$wl")" -gt 1000 ]; then
+            wordlist="$wl"
+            _debug "Using wordlist: $wordlist"
+            break
+        fi
+    done
+
+    if [ -z "$wordlist" ]; then
+        _error "No wordlist found. Install: sudo apt install wamerican or wbritish"
+        return 1
+    fi
+
+    # Select random words (shuf is more secure than sort -R)
+    if command_exists shuf; then
+        shuf -n "$num_words" "$wordlist" 2>/dev/null | paste -sd "$separator" -
+    else
+        # Fallback without shuf (less efficient)
+        local words=()
+        for ((i=0; i<num_words; i++)); do
+            local max_lines
+            max_lines=$(wc -l < "$wordlist")
+            local rand_line=$(( (RANDOM % max_lines) + 1 ))
+            words+=("$(sed -n "${rand_line}p" "$wordlist")")
+        done
+        local IFS="$separator"
+        printf '%s' "${words[*]}"
+    fi
+}
+
+# Password strength verification (optional)
+_check_strength() {
+    local password="$1"
+
+    # Basic checks
+    local length=${#password}
+    local has_upper=0
+    local has_lower=0
+    local has_number=0
+    local has_symbol=0
+
+    if [[ "$password" =~ [A-Z] ]]; then has_upper=1; fi
+    if [[ "$password" =~ [a-z] ]]; then has_lower=1; fi
+    if [[ "$password" =~ [0-9] ]]; then has_number=1; fi
+    if [[ "$password" =~ [^A-Za-z0-9] ]]; then has_symbol=1; fi
+
+    local score=$((has_upper + has_lower + has_number + has_symbol))
+
+    if [ "$length" -lt 8 ]; then
+        _warn "Password too short ($length characters) - Very Weak"
+    elif [ "$length" -lt 12 ] && [ "$score" -lt 3 ]; then
+        _warn "Short password with low variety - Weak"
+    elif [ "$score" -lt 3 ]; then
+        _warn "Password lacks character variety - Medium"
+    fi
+
+    # Cracklib verification if available
+    if command_exists cracklib-check && [ "$length" -lt 20 ]; then
+        local check_result
+        check_result=$(printf '%s\n' "$password" | cracklib-check 2>/dev/null || true)
+        if [[ "$check_result" =~ "dictionary" ]] || [[ "$check_result" =~ "too simple" ]]; then
+            _warn " cracklib: Detectable pattern in dictionary"
+        fi
+    fi
+}
+
+# Hashing functions
+_generate_hash_mkpasswd() {
+    local password=$1
+    local method=${2:-SHA-512}
+    mkpasswd -m "$method" "$password" 2>/dev/null
+}
+
+_generate_hash_openssl() {
+    local password=$1
+    # -6 = SHA512, -5 = SHA256, -1 = MD5 (avoid)
+    openssl passwd -6 "$password" 2>/dev/null
+}
+
+# Unified bcrypt hash via htpasswd (Apache/nginx compatible)
+_generate_hash_bcrypt() {
+    local password=$1
+    local cost=${2:-10}
+
+    # Use -i to read password from stdin (not exposed in ps)
+    # -n: stdout, -B: bcrypt, -C: cost
+    printf '%s' "$password" | htpasswd -niBC "$cost" "" 2>/dev/null | cut -d: -f2
+}
+
+# Base64 encoding (for Kubernetes secrets)
+_encode_base64() {
+    local text=$1
+    local multi_line=${2:-false}
+
+    # Detect if GNU base64 (Linux) or BSD/macOS
+    if base64 --help 2>&1 | grep -q "\-w"; then
+        # GNU base64: use -w 0 for no line breaks
+        if [ "$multi_line" = true ]; then
+            printf '%s' "$text" | base64
+        else
+            printf '%s' "$text" | base64 -w 0
+        fi
+    else
+        # BSD/macOS base64: no -w flag
+        if [ "$multi_line" = true ]; then
+            printf '%s' "$text" | base64
+        else
+            printf '%s' "$text" | base64 | tr -d '\n'
+        fi
+    fi
+}
+
+show_help() {
+    cat << 'EOF'
+Usage: geanforge [OPTIONS]
+
+Generates secure random passwords, PINs, passphrases, or hashes for production.
+
+Main Options:
+  -l, --length N         Password length (default: 20, max: 256)
+  -n, --count N          Number of passwords (default: 1, max: 100)
+  -m, --method METHOD    Method: random, openssl-rand, mkpasswd, openssl, bcrypt
+                         (default: random)
+
+Special Modes:
+  -p, --pin N            Generate numeric PIN of N digits (avoids leading zero)
+  -w, --words N          Generate passphrase with N words (Diceware)
+  -W, --word-sep CHAR    Separator for passphrase (default: -)
+  -b, --base64           Convert output to base64 (ideal for K8s secrets)
+
+Character Configuration:
+  -s, --no-symbols       Alphanumeric only
+  -a, --no-ambiguous     Remove 0,O,l,1,I, etc.
+  -x, --hexadecimal      Hexadecimal (0-9,A-F)
+  -e, --entropy          Check system entropy before generating
+
+Output:
+  -S, --show-password    Show plaintext password when using hash methods
+  -C, --clipboard        Copy last password to clipboard (auto-detects X11/Wayland)
+  -f, --file FILE        Save to file (perm 600) with metadata
+  --cost N               Cost for bcrypt (default: 10)
+
+Security:
+  -F, --strength         Verify generated password strength
+  --force-low-entropy    Ignore low entropy warning
+
+Examples:
+  # Basic
+  geanforge
+
+  # 6-digit PIN (2FA/banking)
+  geanforge -p 6
+
+  # Memorable passphrase (Diceware)
+  geanforge -w 5
+
+  # Bcrypt hash for web application
+  geanforge -l 16 -m bcrypt --cost 12 -S
+
+  # Multiple passwords for Kubernetes secrets
+  geanforge -n 10 -l 32 -f passwords-k8s.txt
+
+  # Base64 password for Kubernetes secret
+  geanforge -l 32 -b
+
+  # Passphrase in base64
+  geanforge -w 5 -b
+
+  # Multiple base64 passwords for secrets
+  geanforge -n 5 -l 24 -b -f secrets-k8s.txt
+
+  # Strong password with verification
+  geanforge -l 24 -a -F -C
+
+Kubernetes Integration:
+  # Generate secret directly
+  kubectl create secret generic app-secret \
+    --from-literal=password="$(geanforge -l 32 -s)"
+
+  # Secret with base64 value
+  kubectl create secret generic app-secret \
+    --from-literal=password="$(geanforge -l 32 -b)"
+
+Environment:
+  DEBUG=1                Verbose mode
+  FORCE_LOW_ENTROPY=1    Ignore entropy check
+
+EOF
+}
+
+main() {
+    # Defaults
+    local length=20
+    local use_symbols=true
+    local count=1
+    local hex_only=false
+    local no_ambiguous=false
+    local method="random"
+    local show_password=false
+    local copy_clipboard=false
+    local output_file=""
+    local check_strength=false
+    local check_entropy=false
+    local pin_mode=false
+    local passphrase_mode=false
+    local num_words=0
+    local word_separator="-"
+    local bcrypt_cost=10
+    local encode_base64=false
+
+    # Extended traps for all possible exits
+    trap '_cleanup_sensitive_vars' EXIT
+
+    # Argument parsing
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -l|--length)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || { _error "Length must be positive integer"; return 1; }
+                length="$2"
+                shift 2
+                ;;
+            -n|--count)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || { _error "Invalid count"; return 1; }
+                count="$2"
+                shift 2
+                ;;
+            -p|--pin)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] && [ "$2" -le "$MAX_PIN" ] || {
+                    _error "PIN must have 1-$MAX_PIN digits"; return 1;
+                }
+                pin_mode=true
+                length="$2"  # Reuse variable for PIN size
+                shift 2
+                ;;
+            -w|--words)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge "$MIN_WORDS" ] || {
+                    _error "Minimum of $MIN_WORDS words"; return 1;
+                }
+                passphrase_mode=true
+                num_words="$2"
+                shift 2
+                ;;
+            -W|--word-sep)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                word_separator="$2"
+                shift 2
+                ;;
+            -s|--no-symbols)
+                use_symbols=false
+                shift
+                ;;
+            -a|--no-ambiguous)
+                no_ambiguous=true
+                shift
+                ;;
+            -x|--hexadecimal)
+                hex_only=true
+                shift
+                ;;
+            -m|--method)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                case "$2" in
+                    random|openssl-rand|mkpasswd|openssl|bcrypt) method="$2" ;;
+                    *) _error "Invalid method: random, openssl-rand, mkpasswd, openssl, bcrypt"; return 1 ;;
+                esac
+                shift 2
+                ;;
+            --cost)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge 4 ] && [ "$2" -le 31 ] || {
+                    _error "Bcrypt cost must be 4-31"; return 1;
+                }
+                bcrypt_cost="$2"
+                shift 2
+                ;;
+            -S|--show-password)
+                show_password=true
+                shift
+                ;;
+            -C|--clipboard)
+                copy_clipboard=true
+                shift
+                ;;
+            -f|--file)
+                [[ -n "${2:-}" ]] || { _error "Option $1 requires value"; return 1; }
+                output_file="$2"
+                shift 2
+                ;;
+            -F|--strength)
+                check_strength=true
+                shift
+                ;;
+            -e|--entropy)
+                check_entropy=true
+                shift
+                ;;
+            --force-low-entropy)
+                export FORCE_LOW_ENTROPY=1
+                shift
+                ;;
+            -b|--base64)
+                encode_base64=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                return 0
+                ;;
+            *)
+                _error "Unknown option: $1"
+                show_help
+                return 1
+                ;;
+        esac
+    done
+
+    # Invalid combination validations
+    if [ "$pin_mode" = true ] && [ "$passphrase_mode" = true ]; then
+        _error "Do not use --pin and --words simultaneously"
+        return 1
+    fi
+
+    if [ "$hex_only" = true ] && [ "$no_ambiguous" = true ]; then
+        _error "Hexadecimal and no-ambiguous are incompatible"
+        return 1
+    fi
+
+    if [ "$passphrase_mode" = true ]; then
+        if [ "$hex_only" = true ] || [ "$no_ambiguous" = true ] || [ "$use_symbols" = false ]; then
+            _error "Character options not applicable to passphrases"
+            return 1
+        fi
+    fi
+
+    # Global limits
+    if [ "$length" -gt "$MAX_LENGTH" ]; then
+        _error "Maximum length: $MAX_LENGTH"
+        return 1
+    fi
+
+    if [ "$count" -gt "$MAX_QUANTITY" ]; then
+        _error "Maximum count: $MAX_QUANTITY"
+        return 1
+    fi
+
+    # Entropy verification if requested or in paranoid mode
+    if [ "$check_entropy" = true ] || [ "$pin_mode" = false -a "$length" -gt 32 ]; then
+        _check_entropy || return 1
+    fi
+
+    # Method dependency verification
+    case "$method" in
+        mkpasswd)
+            command_exists mkpasswd || { _error "Install: sudo apt install whois"; return 1; }
+            ;;
+        openssl|openssl-rand)
+            command_exists openssl || { _error "OpenSSL not installed"; return 1; }
+            ;;
+        bcrypt)
+            command_exists htpasswd || { _error "Install: sudo apt install apache2-utils (Debian) | sudo dnf install httpd-tools (RHEL) | brew install httpd (macOS)"; return 1; }
+            ;;
+    esac
+
+    # Output file setup
+    if [ -n "$output_file" ]; then
+        touch "$output_file" 2>/dev/null || { _error "Could not create $output_file"; return 1; }
+        chmod 600 "$output_file"
+
+        # Metadata
+        {
+            echo "# ==========================================="
+            echo "# Generated by: geanforge"
+            echo "# Date: $(date +%Y-%m-%dT%H:%M:%S%z)"
+            echo "# Host: $(hostname)"
+            echo "# User: $(whoami)"
+            echo "# Method: $method"
+            if [ "$passphrase_mode" = true ]; then
+                echo "# Words: $num_words | Sep: $word_separator"
+            else
+                echo "# Length: $length | Count: $count"
+            fi
+            if [ "$encode_base64" = true ]; then
+                echo "# Encoding: base64"
+            fi
+            echo "# Recommendation: Remove after use (auto-destruction in 24h ideal)"
+            echo "# ==========================================="
+        } >> "$output_file"
+    fi
+
+    # Informational message
+    if [ "$pin_mode" = true ]; then
+        _info "Generating PIN of $length digits..."
+    elif [ "$passphrase_mode" = true ]; then
+        _info "Generating Diceware passphrase ($num_words words)..."
+    else
+        case "$method" in
+            random) _info "Generation via /dev/urandom..." ;;
+            openssl-rand) _info "Generation via OpenSSL..." ;;
+            mkpasswd) _info "SHA-512 hash (whois)..." ;;
+            openssl) _info "SHA-512 hash (OpenSSL)..." ;;
+            bcrypt) _info "Bcrypt hash (cost: $bcrypt_cost)..." ;;
+        esac
+    fi
+
+    # Main generation
+    local last_password=""
+    local last_password_clipboard=""
+    local clipboard_detected
+    clipboard_detected=$(_detect_clipboard)
+
+    if [ "$copy_clipboard" = true ]; then
+        if [ "$clipboard_detected" == "none" ]; then
+            _warn "Clipboard not detected (install: wl-clipboard, xclip, or pbcopy)"
+            copy_clipboard=false
+        else
+            _debug "Clipboard detected: $clipboard_detected"
+        fi
+    fi
+
+    for ((i=1; i<=count; i++)); do
+        [ "$count" -gt 1 ] && echo -e "${CYAN}--- Item $i ---${NC}"
+
+        local password=""
+        local plain_password=""  # For hash methods
+        local charset=""
+
+        # Generation logic
+        if [ "$pin_mode" = true ]; then
+            password=$(_generate_pin "$length") || { _error "Failed to generate PIN"; return 1; }
+
+        elif [ "$passphrase_mode" = true ]; then
+            password=$(_generate_passphrase "$num_words" "$word_separator") || {
+                _error "Failed to generate passphrase"; return 1
+            }
+
+        else
+            # Traditional password mode
+            case "$method" in
+                random)
+                    charset=$(_generate_charset "$hex_only" "$use_symbols" "$no_ambiguous")
+                    password=$(_generate_password_urandom "$length" "$charset") || {
+                        _error "Failed in urandom generation"; return 1
+                    }
+                    ;;
+
+                openssl-rand)
+                    password=$(_generate_password_openssl_rand "$length" "$no_ambiguous") || {
+                        _error "Failed in OpenSSL rand"; return 1
+                    }
+                    ;;
+
+                mkpasswd|openssl|bcrypt)
+                    # Generate plaintext password first
+                    charset=$(_generate_charset "$hex_only" "$use_symbols" "$no_ambiguous")
+                    plain_password=$(_generate_password_urandom "$length" "$charset") || {
+                        _error "Failed to generate base password"; return 1
+                    }
+
+                    [ -n "$plain_password" ] || { _error "Empty password"; return 1; }
+
+                    # Apply hash
+                    case "$method" in
+                        mkpasswd) password=$(_generate_hash_mkpasswd "$plain_password") ;;
+                        openssl) password=$(_generate_hash_openssl "$plain_password") ;;
+                        bcrypt) password=$(_generate_hash_bcrypt "$plain_password" "$bcrypt_cost") ;;
+                    esac
+
+                    if [ -z "$password" ]; then
+                        _error "Failed in hashing"; return 1
+                    fi
+
+                    if [ "$show_password" = true ]; then
+                        echo -e "${MAGENTA}Password:${NC} ${GREEN}${plain_password}${NC}"
+                        last_password_clipboard="$plain_password"
+                    else
+                        last_password_clipboard="$password"
+                    fi
+                    ;;
+            esac
+        fi
+
+        # Final validation
+        [ -n "$password" ] || { _error "Generated empty password"; return 1; }
+
+        # Base64 encoding if requested
+        if [ "$encode_base64" = true ]; then
+            if [ -n "$plain_password" ]; then
+                # Hash methods: encode the plaintext password
+                password=$(_encode_base64 "$plain_password")
+            else
+                # Random/openssl/pin/passphrase: encode the generated password
+                password=$(_encode_base64 "$password")
+            fi
+
+            [ -n "$password" ] || { _error "Failed in base64 encoding"; return 1; }
+            _debug "Password converted to base64"
+        fi
+
+        # Formatted output
+        if [ "$passphrase_mode" = true ]; then
+            echo -e "${GREEN}${password}${NC}"
+        else
+            echo -e "${GREEN}${password}${NC}"
+        fi
+
+        # Strength verification (if requested and non-hash mode)
+        if [ "$check_strength" = true ] && [[ "$method" =~ ^(random|openssl-rand)$ ]]; then
+            _check_strength "$password"
+        fi
+
+        # Persistence
+        [ -n "$output_file" ] && echo "$password" >> "$output_file"
+
+        # Update clipboard candidate
+        last_password="$password"
+        if [[ "$method" =~ ^(random|openssl-rand)$ ]] || [ "$pin_mode" = true ] || [ "$passphrase_mode" = true ]; then
+            last_password_clipboard="$password"
+        fi
+
+        # Visual separator
+        [ "$count" -gt 1 ] && [ "$i" -lt "$count" ] && echo
+    done
+
+    # Final clipboard
+    if [ "$copy_clipboard" = true ] && [ -n "$last_password_clipboard" ]; then
+        if _copy_clipboard "$last_password_clipboard"; then
+            _success "Copied to clipboard ($(echo "$clipboard_detected" | tr '[:lower:]' '[:upper:]'))"
+            _info "Clipboard will be cleared automatically in 30s (if possible)"
+            # Try to clear after 30s (background, non-blocking)
+            (sleep 30 && printf '' | _copy_clipboard "" 2>/dev/null) &
+        else
+            _warn "Failed to copy to clipboard"
+        fi
+    fi
+
+    # Summary
+    if [ -n "$output_file" ]; then
+        _success "Saved to: $output_file (perm: 600, $(wc -l < "$output_file") lines)"
+        _info "Remove file after use: rm -f $output_file"
+    fi
+
+    # Contextual security warnings
+    if [ "$length" -lt 12 ] && [ "$pin_mode" = false ] && [ "$passphrase_mode" = false ]; then
+        _warn "Passwords < 12 characters not recommended for production"
+    fi
+
+    if [ "$method" == "bcrypt" ]; then
+        _info "Bcrypt format ideal for modern web applications"
+    elif [[ "$method" =~ ^(mkpasswd|openssl)$ ]]; then
+        _info "Use this hash in /etc/shadow or legacy systems"
+    fi
+
+    if [ "$encode_base64" = true ]; then
+        _info "Base64 values ready for use in Kubernetes secrets"
+    fi
+
+    # Explicit cleanup before exit
+    _cleanup_sensitive_vars
+    return 0
+}
+
+main "$@"
