@@ -1,8 +1,3 @@
-Aqui está o README.md profissional completo para o `geanforge`, pronto para ser publicado no GitHub:
-
-## 📄 README.md
-
-```markdown
 <p align="center">
   <img src="https://img.shields.io/badge/geanforge-v1.0.0-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
@@ -423,4 +418,3 @@ SOFTWARE.
   Made with 🔒 by <a href="https://github.com/g3anmart1ns">Gean Martins</a><br>
   <sub>If this project helped you, consider giving it a ⭐️ on GitHub!</sub>
 </p>
-```
