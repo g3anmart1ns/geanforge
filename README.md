@@ -326,14 +326,43 @@ FORCE_LOW_ENTROPY=1 geanforge -l 32
 ## 🧪 Testing
 
 ```bash
-# Run basic tests
-bash tests/test_basic.sh
+#!/bin/bash
+# Basic tests for geanforge
 
-# Run all tests
-bash tests/test_all.sh
+set -e
 
-# Test specific functionality
-geanforge -l 32 -b | base64 -d | wc -c  # Should output 32
+GEANFORGE="./geanforge"
+
+echo "Running basic tests..."
+
+# Test 1: Default generation
+echo "Test 1: Default generation"
+password=$($GEANFORGE | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+[ ${#password} -eq 20 ] && echo "✓ Default length OK" || echo "✗ Default length FAIL"
+
+# Test 2: Custom length
+echo "Test 2: Custom length"
+password=$($GEANFORGE -l 32 | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+[ ${#password} -eq 32 ] && echo "✓ Custom length OK" || echo "✗ Custom length FAIL"
+
+# Test 3: Base64 encoding
+echo "Test 3: Base64 encoding"
+b64=$($GEANFORGE -l 16 -b | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+decoded=$(echo "$b64" | base64 -d 2>/dev/null | wc -c)
+[ "$decoded" -eq 16 ] && echo "✓ Base64 encoding OK" || echo "✗ Base64 encoding FAIL"
+
+# Test 4: PIN generation
+echo "Test 4: PIN generation"
+pin=$($GEANFORGE -p 6 | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+[ ${#pin} -eq 6 ] && [[ "$pin" =~ ^[0-9]+$ ]] && echo "✓ PIN generation OK" || echo "✗ PIN generation FAIL"
+
+# Test 5: Passphrase
+echo "Test 5: Passphrase generation"
+phrase=$($GEANFORGE -w 5 | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+word_count=$(echo "$phrase" | tr '-' '\n' | wc -l)
+[ "$word_count" -eq 5 ] && echo "✓ Passphrase OK" || echo "✗ Passphrase FAIL"
+
+echo "All tests completed!"
 ```
 
 ## 🤝 Contributing
@@ -403,7 +432,7 @@ SOFTWARE.
 
 **Gean Martins**
 
-- GitHub: [@g3anmart1ns](https://github.com/geanmartins)
+- GitHub: [@g3anmart1ns](https://github.com/g3anmart1ns)
 - Project: [geanforge](https://github.com/g3anmart1ns/geanforge)
 
 ## 🙏 Acknowledgments
